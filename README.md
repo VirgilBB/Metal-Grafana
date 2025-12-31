@@ -262,6 +262,7 @@ curl -X POST http://<YOUR_NODE_IP>:9650/ext/info \
 
 ## Resources
 
+- [Metal-Grafana Repository](https://github.com/VirgilBB/Metal-Grafana)
 - [Metal Monitoring Repository](https://github.com/MetalBlockchain/metal-monitoring)
 - [Prometheus Documentation](https://prometheus.io/docs/)
 - [Grafana Documentation](https://grafana.com/docs/)
