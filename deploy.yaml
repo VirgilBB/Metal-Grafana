@@ -1,0 +1,461 @@
+version: "2.1"
+
+# ========================================
+# MONITORING SERVICES EXPLANATION
+# ========================================
+# 
+# VERSION 2.1: Uses IP Lease for Grafana
+# - Grafana gets a dedicated IP address (like validator deployment)
+# - Access via: http://<GRAFANA_IP>:3000 (direct IP, no forwarded ports)
+# - This bypasses provider port forwarding restrictions
+# ========================================
+# 
+# 1. PROMETHEUS (Required for Grafana)
+#    - Scrapes metrics from Metal node and stores them
+#    - Grafana reads metrics from Prometheus
+#    - Without Prometheus, Grafana has no data to display
+#    - Status: REQUIRED (Grafana depends on it)
+#
+# 2. GRAFANA (Main UI - Most Important)
+#    - Visualizes metrics from Prometheus in dashboards
+#    - This is what users interact with
+#    - Status: REQUIRED (This is the main service)
+#
+# 3. NODE-EXPORTER (Optional)
+#    - Scrapes system metrics (CPU, memory, disk) from container
+#    - Useful for monitoring resource usage
+#    - Not required for Metal blockchain metrics
+#    - Status: OPTIONAL (Can be removed if not needed)
+#
+# ========================================
+
+endpoints:
+  grafana_endpoint:
+    kind: ip
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    env:
+      # ⚠️ UPDATE THIS WITH YOUR VALIDATOR IP! ⚠️
+      # Set this to your Metal node's RPC endpoint
+      # Format: http://<your-metal-node-ip>:9650
+      # 
+      # Get your Metal node IP from Akash Console → Your Metal Deployment → IP(s) field
+      # Then replace YOUR_VALIDATOR_IP_HERE below with JUST the IP (the :9650 is already included)
+      # 
+      # Example for mainnet: http://162.230.144.169:9650
+      # Example for testnet: http://38.135.51.194:9650
+      # 
+      # ⚠️ IMPORTANT: Replace ONLY the IP part, keep :9650 at the end!
+      # Replace this: http://YOUR_VALIDATOR_IP_HERE:9650
+      # With this:    http://162.230.144.169:9650 (using your actual IP)
+      - METAL_NODE_URL=http://YOUR_VALIDATOR_IP_HERE:9650
+    expose:
+      - port: 9090
+        as: 9090
+        to:
+          - global: true
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo "Starting Prometheus configuration..."
+        mkdir -p /etc/prometheus /prometheus
+        METAL_TARGET="${METAL_NODE_URL#http://}"; METAL_TARGET="${METAL_TARGET#https://}"
+        echo "Metal node target: ${METAL_TARGET}"
+        cat > /etc/prometheus/prometheus.yml << EOF
+        global:
+          scrape_interval: 15s
+          evaluation_interval: 15s
+        scrape_configs:
+          - job_name: 'prometheus'
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: 'metalgo'
+            metrics_path: '/ext/metrics'
+            static_configs:
+              - targets: ['${METAL_TARGET}']
+          - job_name: 'node-exporter'
+            static_configs:
+              - targets: ['node-exporter:9100']
+        EOF
+        echo "Prometheus config created"
+        /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --web.enable-lifecycle --log.level=info 2>&1 &
+        PROMETHEUS_PID=$!
+        echo "Prometheus started with PID: $PROMETHEUS_PID"
+        while kill -0 $PROMETHEUS_PID 2>/dev/null; do sleep 30; echo "[$(date)] Prometheus running"; done
+        echo "Prometheus exited"
+        exit 1
+
+  grafana:
+    image: grafana/grafana:latest
+    env:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=password123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_HTTP_ADDR=0.0.0.0
+      - GF_SERVER_HTTP_PORT=3000
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-http://localhost:3000}
+      # ⚠️ PROMETHEUS URL CONFIGURATION ⚠️
+      # 
+      # Option 1: Try service name first (default - may work if DNS resolves)
+      # Format: http://prometheus:9090
+      # 
+      # Option 2: If service name doesn't work, update this after deployment:
+      # 1. Get Prometheus forwarded port from Akash Console:
+      #    Monitoring Deployment → Leases tab → prometheus Group → Forwarded Ports
+      #    Example: 9090:32580 (use the second number: 32580)
+      # 2. Get provider hostname from Akash Console (shown in Leases tab)
+      #    Example: provider.d3akash.cloud
+      # 3. Update this line to: http://<PROVIDER>:<FORWARDED_PORT>
+      #    Example: http://provider.d3akash.cloud:32580
+      # 4. Or set via Akash Console → Environment Variables → PROMETHEUS_URL
+      # 
+      # Default: Try service name first (works if services can resolve each other)
+      - PROMETHEUS_URL=http://prometheus:9090
+    expose:
+      - port: 3000
+        as: 3000
+        to:
+          - global: true
+            ip: grafana_endpoint
+        proto: tcp
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo "Starting Grafana..."
+        echo "⚠️  Note: You may see 'database is locked' messages during startup - this is normal!"
+        echo "   Grafana is initializing its database and will be ready shortly."
+        echo ""
+        
+        # Create provisioning directories
+        mkdir -p /etc/grafana/provisioning/datasources
+        mkdir -p /etc/grafana/provisioning/dashboards
+        
+        # Auto-configure Prometheus data source
+        echo "Configuring Prometheus data source..."
+        
+        # Try to detect if service name works, otherwise use environment variable
+        PROM_URL="${PROMETHEUS_URL:-http://prometheus:9090}"
+        
+        # Test if Prometheus is reachable (wait a bit for services to start)
+        echo "Testing Prometheus connection..."
+        sleep 10
+        if curl -s --max-time 5 "${PROM_URL}/api/v1/status/config" > /dev/null 2>&1; then
+          echo "✅ Prometheus reachable at: ${PROM_URL}"
+        else
+          echo "⚠️  Warning: Cannot reach Prometheus at ${PROM_URL}"
+          echo "   If dashboards are empty, update PROMETHEUS_URL environment variable:"
+          echo "   1. Get Prometheus forwarded port from Akash Console"
+          echo "   2. Format: http://<PROVIDER>:<FORWARDED_PORT>"
+          echo "   3. Update in Akash Console → Environment Variables → PROMETHEUS_URL"
+        fi
+        
+        cat > /etc/grafana/provisioning/datasources/prometheus.yml << EOF
+        apiVersion: 1
+        
+        datasources:
+          - name: Prometheus
+            type: prometheus
+            access: proxy
+            url: ${PROM_URL}
+            isDefault: true
+            editable: true
+        EOF
+        echo "✅ Prometheus data source configured: ${PROM_URL}"
+        echo "   (You can edit this in Grafana: Configuration → Data Sources → Prometheus)"
+        echo ""
+        
+        /run.sh 2>&1 &
+        GRAFANA_PID=$!
+        echo "Grafana started with PID: $GRAFANA_PID"
+        echo ""
+        echo "Waiting for Grafana to be ready (30 seconds)..."
+        sleep 30
+        echo "Checking if Grafana is listening on port 3000..."
+        for i in {1..10}; do
+          if netstat -tuln 2>/dev/null | grep -q ":3000 " || ss -tuln 2>/dev/null | grep -q ":3000 "; then
+            echo "✅ Grafana is listening on port 3000"
+            break
+          fi
+          echo "   Waiting for Grafana to start... ($i/10)"
+          sleep 3
+        done
+        echo ""
+        echo "========================================"
+        echo "=== GRAFANA ACCESS INFORMATION ==="
+        echo "========================================"
+        echo ""
+        echo "📊 How to Access Grafana:"
+        echo ""
+        echo "   ✅ VERSION 2.1: Grafana uses IP Lease (Direct IP Access)"
+        echo ""
+        echo "   METHOD 1: Get IP from Akash Console (Recommended)"
+        echo "   1. Go to: Akash Console → Your Monitoring Deployment"
+        echo "   2. Look for 'IP(s)' field (should show Grafana IP)"
+        echo "   3. Copy the IP address (e.g., 162.230.144.169)"
+        echo "   4. Access Grafana at: http://<GRAFANA_IP>:3000"
+        echo "      Example: http://162.230.144.169:3000"
+        echo "   5. Press Enter - Grafana login page should appear"
+        echo ""
+        echo "   METHOD 2: Check Leases Tab for IP"
+        echo "   1. Go to: Akash Console → Your Monitoring Deployment → Leases tab"
+        echo "   2. Find 'grafana' Group section"
+        echo "   3. Look for 'IP(s)' field (shows dedicated IP)"
+        echo "   4. Access Grafana at: http://<GRAFANA_IP>:3000"
+        echo ""
+        echo "🔑 LOGIN:"
+        echo "   Username: admin"
+        echo "   Password: password123"
+        echo ""
+        echo "========================================"
+        echo "=== ⚠️  IF DASHBOARDS ARE EMPTY ⚠️  ==="
+        echo "========================================"
+        echo ""
+        echo "   Follow these 2 STEPS to fix empty dashboards:"
+        echo ""
+        echo "   📊 STEP 1: Check Prometheus Data Source"
+        echo "   1. In Grafana: Click gear icon (⚙️) in left sidebar"
+        echo "   2. Click 'Data Sources'"
+        echo "   3. Click 'Prometheus'"
+        echo "   4. Click 'Save & Test' button"
+        echo "   5. ✅ If shows 'Data source is working' → Go to STEP 2"
+        echo "   6. ❌ If shows error → Fix URL (see below)"
+        echo ""
+        echo "   🔧 FIX DATA SOURCE URL (if STEP 1 failed):"
+        echo "   1. In same Grafana page, find 'URL' field"
+        echo "   2. Get Prometheus info from Akash Console → Leases tab:"
+        echo "      - Provider name (top of page, e.g., provider.akash.tagus.host)"
+        echo "      - Prometheus forwarded port: 'prometheus' Group → 'Forwarded Ports: 9090:XXXXX'"
+        echo "        Use the SECOND number (e.g., if shows 9090:32106, use 32106)"
+        echo "   3. Update URL to: http://<PROVIDER>:<PROMETHEUS_PORT>"
+        echo "      Example: http://provider.akash.tagus.host:32106"
+        echo "   4. Click 'Save & Test' → Should show ✅ 'Data source is working'"
+        echo ""
+        echo "   📊 STEP 2: Verify Prometheus is Scraping Metal Node"
+        echo "   1. Open Prometheus in new browser tab:"
+        echo "      http://<PROVIDER>:<PROMETHEUS_FORWARDED_PORT>"
+        echo "      (Use same provider and Prometheus port from above)"
+        echo "   2. Click 'Status' menu → 'Targets'"
+        echo "   3. Look for 'metalgo' target → Should show 'UP' (green)"
+        echo "   4. If 'metalgo' shows 'DOWN' → Check METAL_NODE_URL is correct"
+        echo ""
+        echo "   ✅ Once both steps work, dashboards will populate!"
+        echo ""
+        echo "⚠️  Note: Only click the 'grafana' forwarded port link (3000:XXXXX)"
+        echo "   The prometheus (9090:XXXXX) and node-exporter (9100:XXXXX) links"
+        echo "   are for internal monitoring, not for user access."
+        echo ""
+        echo "🔧 Troubleshooting if link doesn't work:"
+        echo ""
+        echo "   ✅ Grafana is working if you see:"
+        echo "      - 'Grafana is listening on port 3000' in logs"
+        echo "      - Health check shows 'OK' in status messages"
+        echo ""
+        echo "   If forwarded port link doesn't work, follow these steps:"
+        echo ""
+        echo "   STEP 1: Verify Grafana is running (from Shell tab):"
+        echo "      Run: curl http://localhost:3000/api/health"
+        echo "      Expected: {\"commit\":\"...\",\"database\":\"ok\",\"version\":\"...\"}"
+        echo "      ✅ If this works → Grafana is fine, issue is provider port forwarding"
+        echo "      ❌ If this fails → Grafana may not be fully started, wait 1-2 minutes"
+        echo ""
+        echo "   STEP 2: Verify the forwarded port number:"
+        echo "      - Go to Akash Console → Leases tab"
+        echo "      - Find 'grafana' Group → 'Forwarded Ports: 3000:XXXXX'"
+        echo "      - Make sure you're using the SECOND number (after colon)"
+        echo "      - Example: If shows '3000:30732', use port 30732"
+        echo "      - Double-check you're using the grafana port, not prometheus/node-exporter"
+        echo ""
+        echo "   STEP 3: Test the URL format:"
+        echo "      - Format: http://<PROVIDER>:<FORWARDED_PORT>"
+        echo "      - NO trailing slash needed (but won't hurt)"
+        echo "      - Example: http://provider.akash.tagus.host:30732"
+        echo "      - Try both: with and without trailing slash"
+        echo ""
+        echo "   STEP 4: Check for common issues:"
+        echo "      - Browser cache: Try incognito/private window"
+        echo "      - HTTPS vs HTTP: Use http:// (not https://)"
+        echo "      - Firewall: Some networks block non-standard ports"
+        echo "      - VPN: Try from different network or disable VPN"
+        echo "      - Provider restrictions: Some providers block external access"
+        echo ""
+        echo "   STEP 5: Test from command line (if available):"
+        echo "      Run: curl -v http://provider.akash.tagus.host:30732/api/health"
+        echo "      (Replace with YOUR provider and port)"
+        echo "      - If connection times out → Provider firewall blocking"
+        echo "      - If connection refused → Port not forwarded correctly"
+        echo "      - If 200 OK → Grafana is accessible (browser issue)"
+        echo ""
+        echo "   STEP 6: Contact provider if all above fail:"
+        echo "      - Some providers require whitelisting your IP"
+        echo "      - Some providers have firewall rules blocking external access"
+        echo "      - Check provider documentation for port forwarding requirements"
+        echo ""
+        echo "   ⚠️  IMPORTANT: If Grafana health check works from Shell but"
+        echo "      external URL doesn't work, this is a PROVIDER-SIDE issue,"
+        echo "      not a Grafana configuration issue."
+        echo ""
+        echo "   🔴 KNOWN ISSUE: Some Akash providers block external access to"
+        echo "      forwarded ports for security reasons. If you see:"
+        echo "      - 'Connection refused' from external curl/browser"
+        echo "      - But 'localhost:3000/api/health' works from Shell"
+        echo "      → Your provider is blocking external port forwarding"
+        echo ""
+        echo "   💡 WORKAROUNDS (if provider blocks external access):"
+        echo "      1. Use Akash Console's built-in port forwarding (if available)"
+        echo "      2. Deploy to a different provider that allows external access"
+        echo "      3. Use SSH tunnel: ssh -L 3000:localhost:3000 user@provider"
+        echo "      4. Contact provider to request external port access"
+        echo ""
+        echo "========================================"
+        echo ""
+        while kill -0 $GRAFANA_PID 2>/dev/null; do
+          sleep 15
+          echo ""
+          echo "========================================"
+          echo "📊 GRAFANA ACCESS (ALWAYS AT BOTTOM) 📊"
+          echo "========================================"
+          # Test if Grafana is responding
+          if curl -s --max-time 2 http://localhost:3000/api/health > /dev/null 2>&1; then
+            echo "✅ Grafana Status: Running and healthy"
+          else
+            echo "⚠️  Grafana Status: Starting up..."
+          fi
+          echo ""
+          echo "🔗 HOW TO ACCESS GRAFANA:"
+          echo ""
+          echo "   ✅ VERSION 2.1: Grafana uses IP Lease (Direct IP Access)"
+          echo ""
+          echo "   METHOD 1: Get IP from Akash Console (Recommended)"
+          echo "   1. Go to: Akash Console → Your Monitoring Deployment"
+          echo "   2. Look for 'IP(s)' field (should show Grafana IP)"
+          echo "   3. Copy the IP address (e.g., 162.230.144.169)"
+          echo "   4. Access Grafana at: http://<GRAFANA_IP>:3000"
+          echo "      Example: http://162.230.144.169:3000"
+          echo ""
+          echo "   METHOD 2: Check Leases Tab for IP"
+          echo "   1. Go to: Akash Console → Your Monitoring Deployment → Leases tab"
+          echo "   2. Find 'grafana' Group section"
+          echo "   3. Look for 'IP(s)' field (shows dedicated IP)"
+          echo "   4. Access Grafana at: http://<GRAFANA_IP>:3000"
+          echo ""
+          echo "🔑 LOGIN:"
+          echo "   Username: admin"
+          echo "   Password: password123"
+          echo ""
+          echo "📊 AFTER LOGIN - IF DASHBOARDS ARE EMPTY:"
+          echo ""
+          echo "   STEP 1: Check Prometheus Data Source"
+          echo "   1. In Grafana: Click gear icon (⚙️) in left sidebar"
+          echo "   2. Click 'Data Sources'"
+          echo "   3. Click 'Prometheus'"
+          echo "   4. Click 'Save & Test' button"
+          echo "   5. ✅ If shows 'Data source is working' → Go to STEP 2"
+          echo "   6. ❌ If shows error → Fix URL (see below)"
+          echo ""
+          echo "   🔧 FIX DATA SOURCE URL (if STEP 1 failed):"
+          echo "   1. In same Grafana page, find 'URL' field"
+          echo "   2. Get Prometheus info from Akash Console → Leases tab:"
+          echo "      - Provider name (top of page, e.g., provider.akash.tagus.host)"
+          echo "      - Prometheus forwarded port: 'prometheus' Group → 'Forwarded Ports: 9090:XXXXX'"
+          echo "        Use the SECOND number (e.g., if shows 9090:32106, use 32106)"
+          echo "   3. Update URL to: http://<PROVIDER>:<PROMETHEUS_PORT>"
+          echo "      Example: http://provider.akash.tagus.host:32106"
+          echo "   4. Click 'Save & Test' → Should show ✅ 'Data source is working'"
+          echo ""
+          echo "   STEP 2: Verify Prometheus is Scraping Metal Node"
+          echo "   1. Open Prometheus in new browser tab:"
+          echo "      http://<PROVIDER>:<PROMETHEUS_FORWARDED_PORT>"
+          echo "      (Use same provider and Prometheus port from above)"
+          echo "   2. Click 'Status' menu → 'Targets'"
+          echo "   3. Look for 'metalgo' target → Should show 'UP' (green)"
+          echo "   4. If 'metalgo' shows 'DOWN' → Check METAL_NODE_URL is correct"
+          echo ""
+          echo "   ✅ Once both steps work, dashboards will populate!"
+          echo ""
+          echo "========================================"
+          echo "[$(date)] Next update in 15 seconds..."
+        done
+        echo "Grafana exited"
+        exit 1
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    expose:
+      - port: 9100
+        as: 9100
+        to:
+          - global: true
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo "Starting node-exporter..."
+        /bin/node_exporter --log.level=info 2>&1 &
+        NODE_EXPORTER_PID=$!
+        echo "Node exporter started with PID: $NODE_EXPORTER_PID"
+        while kill -0 $NODE_EXPORTER_PID 2>/dev/null; do sleep 30; echo "[$(date)] Node exporter running"; done
+        echo "Node exporter exited"
+        exit 1
+
+profiles:
+  compute:
+    prometheus:
+      resources:
+        cpu:
+          units: 0.1
+        memory:
+          size: 2Gi
+        storage:
+          - size: 2Gi
+
+    grafana:
+      resources:
+        cpu:
+          units: 0.1
+        memory:
+          size: 1Gi
+        storage:
+          - size: 1Gi
+
+    node-exporter:
+      resources:
+        cpu:
+          units: 0.05
+        memory:
+          size: 512Mi
+        storage:
+          - size: 100Mi
+
+  placement:
+    akash-providers:
+      attributes:
+        host: akash
+        ip-lease: true
+      pricing:
+        prometheus:
+          denom: uakt
+          amount: 10
+        grafana:
+          denom: uakt
+          amount: 5
+        node-exporter:
+          denom: uakt
+          amount: 3
+
+deployment:
+  prometheus:
+    akash-providers:
+      profile: prometheus
+      count: 1
+  grafana:
+    akash-providers:
+      profile: grafana
+      count: 1
+  node-exporter:
+    akash-providers:
+      profile: node-exporter
+      count: 1
