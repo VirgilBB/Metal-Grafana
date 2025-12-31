@@ -2,7 +2,7 @@
   <img src="assets/metalblockchain-logo.png" alt="Metal Blockchain Logo" width="200" />
 </p>
 
-# Deploy Metal Validator Monitoring
+# Deploy Metal Validator Monitoring on Grafana
 
 Monitor your Metal blockchain validator node with Prometheus, Grafana, and node_exporter on Akash's decentralized cloud. Get real-time metrics, dashboards, and alerts for your validator deployment.
 
