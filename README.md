@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/metalblockchain-logo.png" alt="Metal Blockchain Logo" width="200" />
+  <img src="https://raw.githubusercontent.com/VirgilBB/Metal-Grafana/main/assets/metal-grafana-logo.png" alt="Metal-Grafana Logo" width="200" />
 </p>
 
 # Deploy Metal Validator Monitoring on Grafana
